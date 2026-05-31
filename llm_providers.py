@@ -27,6 +27,7 @@ def call_llm(
     api_key: str,
     messages: Messages,
     json_mode: bool = False,
+    temperature: float = 0.7,
 ) -> str:
     """
     Dispatch to the appropriate LLM provider and return the raw text response.
@@ -37,6 +38,8 @@ def call_llm(
         api_key: Provider API key.
         messages: Conversation history in OpenAI-style message format.
         json_mode: Request structured JSON output where natively supported.
+        temperature: Sampling temperature. Higher (≈0.9) for diverse question
+            generation; 0.0 for deterministic answer verification.
 
     Returns:
         Raw string response from the model.
@@ -46,13 +49,13 @@ def call_llm(
     """
     try:
         if provider == "OpenAI":
-            return _call_openai(model, api_key, messages, json_mode)
+            return _call_openai(model, api_key, messages, json_mode, temperature)
         elif provider == "Gemini":
-            return _call_gemini(model, api_key, messages)
+            return _call_gemini(model, api_key, messages, temperature)
         elif provider == "Claude":
-            return _call_claude(model, api_key, messages)
+            return _call_claude(model, api_key, messages, temperature)
         elif provider in ("Groq", "Groq (Free)"):
-            return _call_groq(model, api_key, messages, json_mode)
+            return _call_groq(model, api_key, messages, json_mode, temperature)
         else:
             raise ValueError(f"Unknown provider: {provider!r}")
     except ValueError:
@@ -63,14 +66,16 @@ def call_llm(
 
 # ─── OpenAI ──────────────────────────────────────────────────────────────────
 
-def _call_openai(model: str, api_key: str, messages: Messages, json_mode: bool) -> str:
+def _call_openai(
+    model: str, api_key: str, messages: Messages, json_mode: bool, temperature: float
+) -> str:
     from openai import OpenAI, AuthenticationError, RateLimitError
 
     client = OpenAI(api_key=api_key)
     kwargs: dict = {
         "model": model,
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": 4096,
     }
     if json_mode:
@@ -88,7 +93,7 @@ def _call_openai(model: str, api_key: str, messages: Messages, json_mode: bool) 
 
 # ─── Claude ──────────────────────────────────────────────────────────────────
 
-def _call_claude(model: str, api_key: str, messages: Messages) -> str:
+def _call_claude(model: str, api_key: str, messages: Messages, temperature: float) -> str:
     from anthropic import Anthropic, AuthenticationError
 
     client = Anthropic(api_key=api_key)
@@ -104,6 +109,7 @@ def _call_claude(model: str, api_key: str, messages: Messages) -> str:
     kwargs: dict = {
         "model": model,
         "max_tokens": 8192,
+        "temperature": temperature,
         "messages": chat_messages,
     }
     if system_content:
@@ -119,7 +125,7 @@ def _call_claude(model: str, api_key: str, messages: Messages) -> str:
 
 # ─── Gemini ──────────────────────────────────────────────────────────────────
 
-def _call_gemini(model: str, api_key: str, messages: Messages) -> str:
+def _call_gemini(model: str, api_key: str, messages: Messages, temperature: float) -> str:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
@@ -136,14 +142,16 @@ def _call_gemini(model: str, api_key: str, messages: Messages) -> str:
             history.append({"role": "model", "parts": [msg["content"]]})
 
     system_instruction = "\n\n".join(system_parts) if system_parts else None
+    gen_config = {"temperature": temperature}
 
     try:
         model_obj = genai.GenerativeModel(
             model_name=model,
             system_instruction=system_instruction,
+            generation_config=gen_config,
         )
     except Exception:
-        # Older SDK versions may not accept system_instruction
+        # Older SDK versions may not accept system_instruction / generation_config
         model_obj = genai.GenerativeModel(model_name=model)
 
     try:
@@ -166,14 +174,16 @@ def _call_gemini(model: str, api_key: str, messages: Messages) -> str:
 
 # ─── Groq ────────────────────────────────────────────────────────────────────
 
-def _call_groq(model: str, api_key: str, messages: Messages, json_mode: bool) -> str:
+def _call_groq(
+    model: str, api_key: str, messages: Messages, json_mode: bool, temperature: float
+) -> str:
     from groq import Groq, AuthenticationError, RateLimitError
 
     client = Groq(api_key=api_key)
     kwargs: dict = {
         "model": model,
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": 4096,
     }
     if json_mode:

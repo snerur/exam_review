@@ -67,10 +67,17 @@ def generate_exam(
     difficulties: list[str],
     progress_cb: Callable[[int, int, str], None] | None = None,
     groq_delay: float = 2.0,
+    avoid_questions: list[str] | None = None,
+    verify: bool = True,
 ) -> list[Question]:
     """
     Generate `num_questions` MCQ questions covering `topics` at the specified
     `difficulties`.  Large exams are split into batches of BATCH_SIZE.
+
+    Questions are deduplicated both within this call and against `avoid_questions`
+    (e.g. questions already shown elsewhere in the session), so practice and exam
+    sets do not repeat.  When `verify` is set, a deterministic second pass
+    re-checks every answer — recomputing arithmetic — and corrects mistakes.
 
     Args:
         provider: LLM provider name.
@@ -81,6 +88,8 @@ def generate_exam(
         difficulties: Non-empty list of "Easy", "Medium", "Hard".
         progress_cb: Optional callback(batch_done, total_batches, status_msg).
         groq_delay: Seconds to sleep between Groq batches (free-tier rate limit).
+        avoid_questions: Question stems already used elsewhere — never repeat them.
+        verify: Run an accuracy-correction pass over the generated questions.
 
     Returns:
         List of question dicts.
@@ -90,34 +99,69 @@ def generate_exam(
     json_mode = provider in ("OpenAI", "Groq", "Groq (Free)")
 
     all_questions: list[Question] = []
-    total_batches = (num_questions + BATCH_SIZE - 1) // BATCH_SIZE
+    # Stems we must not repeat: previously-seen (passed in) + everything we add.
+    seen_stems: set[str] = {_stem(s) for s in (avoid_questions or []) if s}
+    # Full question texts to show the model as "already asked, do not repeat".
+    avoid_texts: list[str] = list(avoid_questions or [])
 
-    for batch_idx in range(total_batches):
+    total_batches = (num_questions + BATCH_SIZE - 1) // BATCH_SIZE
+    # Allow a few extra rounds to top up questions dropped as duplicates.
+    max_attempts = total_batches + 3
+    attempt = 0
+    sleep_pending = False
+
+    while len(all_questions) < num_questions and attempt < max_attempts:
         remaining = num_questions - len(all_questions)
-        batch_n = min(BATCH_SIZE, remaining)
-        id_offset = len(all_questions)
+        # Over-request a little so duplicates dropped during dedup don't leave us
+        # short — extra questions are simply discarded once the target is met.
+        batch_n = min(BATCH_SIZE, remaining + 5)
 
         if progress_cb:
+            upper = min(num_questions, len(all_questions) + batch_n)
             progress_cb(
-                batch_idx,
+                attempt,
                 total_batches,
-                f"Generating batch {batch_idx + 1}/{total_batches} "
-                f"(questions {id_offset + 1}–{id_offset + batch_n})…",
+                f"Generating questions {len(all_questions) + 1}–"
+                f"{upper} of {num_questions}…",
             )
 
-        messages = _build_messages(topics_str, batch_n, diff_instruction, id_offset + 1)
-        raw = call_llm(provider, model, api_key, messages, json_mode=json_mode)
+        if sleep_pending:
+            time.sleep(groq_delay)
+            sleep_pending = False
+
+        messages = _build_messages(
+            topics_str,
+            batch_n,
+            diff_instruction,
+            len(all_questions) + 1,
+            avoid_texts=avoid_texts,
+            variation_seed=attempt,
+        )
+        # Higher temperature → genuinely different questions across batches/runs.
+        raw = call_llm(
+            provider, model, api_key, messages, json_mode=json_mode, temperature=0.9
+        )
         batch = _parse_response(raw)
 
-        # Re-number to ensure globally unique, sequential IDs
-        for i, q in enumerate(batch):
-            q["id"] = id_offset + i + 1
+        for q in batch:
+            stem = _stem(q.get("question", ""))
+            if not stem or stem in seen_stems:
+                continue  # blank or duplicate — skip it
+            seen_stems.add(stem)
+            avoid_texts.append(q.get("question", ""))
+            q["id"] = len(all_questions) + 1
+            all_questions.append(q)
+            if len(all_questions) >= num_questions:
+                break
 
-        all_questions.extend(batch)
+        attempt += 1
+        if provider in ("Groq", "Groq (Free)"):
+            sleep_pending = True
 
-        # Respect Groq free-tier rate limits between batches
-        if provider in ("Groq", "Groq (Free)") and batch_idx < total_batches - 1:
-            time.sleep(groq_delay)
+    if verify and all_questions:
+        all_questions = _verify_questions(
+            provider, model, api_key, all_questions, json_mode, groq_delay, progress_cb
+        )
 
     if progress_cb:
         progress_cb(total_batches, total_batches, "Done!")
@@ -179,16 +223,32 @@ def _build_difficulty_instruction(difficulties: list[str]) -> str:
     )
 
 
+# Rotating angles that push each batch toward different question styles so a
+# topic gets comprehensive coverage instead of the same canonical questions.
+_VARIATION_ANGLES: list[str] = [
+    "definitions and core terminology",
+    "comparisons and trade-offs between related techniques",
+    "applied scenarios — 'which method/approach fits this situation'",
+    "interpreting formulas, metrics, or numerical results",
+    "common pitfalls, misconceptions, and failure modes",
+    "step-by-step reasoning about how a method behaves",
+]
+
+
 def _build_messages(
     topics_str: str,
     batch_n: int,
     diff_instruction: str,
     start_id: int,
+    avoid_texts: list[str] | None = None,
+    variation_seed: int = 0,
 ) -> list[dict]:
     system = (
         "You are an expert educator and exam writer specializing in computer science, "
         "machine learning, and artificial intelligence. "
         "You create rigorous, unambiguous, high-quality multiple-choice questions. "
+        "Every question must be DISTINCT — never paraphrase or re-use a concept you "
+        "have already been asked to avoid. "
         "You ALWAYS respond with valid JSON only — no markdown fences, no extra text."
     )
 
@@ -214,24 +274,36 @@ def _build_messages(
         indent=2,
     )
 
+    angle = _VARIATION_ANGLES[variation_seed % len(_VARIATION_ANGLES)]
+    avoid_block = _build_avoid_block(avoid_texts)
+
     user = f"""Generate exactly {batch_n} multiple-choice exam questions.
 
-TOPICS (cover proportionally):
+TOPICS (cover comprehensively and proportionally):
 {topics_str}
 
 DIFFICULTY: {diff_instruction}
 
+COVERAGE & VARIETY:
+- Span the full breadth of each topic — its sub-concepts, methods, and edge cases.
+- For THIS batch, emphasize questions about: {angle}.
+- Do NOT cluster around the single most obvious fact of a topic; each question must
+  test a genuinely different idea.
+{avoid_block}
 REQUIREMENTS:
 - Each question has exactly 4 options: A, B, C, D
-- Exactly one option is correct; the others are plausible distractors
-- Questions must be academically rigorous and unambiguous
+- Exactly one option is correct; the others are plausible but clearly wrong
+- Questions must be academically rigorous, self-contained, and unambiguous
 - IDs run from {start_id} to {start_id + batch_n - 1}
-- Vary which letter (A/B/C/D) holds the correct answer — do NOT default to B
+- Vary which letter (A/B/C/D) holds the correct answer — do NOT default to any letter
 
-MATHEMATICAL ACCURACY (verify before output):
+MATHEMATICAL ACCURACY (compute carefully, then re-check before output):
+- Work through every calculation step by step and confirm the marked answer is the
+  result of that calculation — not an approximation or a distractor.
 - CNN output spatial size: floor((input + 2·padding − filter_size) / stride) + 1
   Example — 32×32 input, 3×3 filter, stride 1, no padding: (32 − 3)/1 + 1 = 30
-- Double-check every computed numerical value in both the question and all options
+- Verify each numerical value appearing in the question stem AND in all four options.
+- Only include a math question if you are certain the arithmetic is correct.
 
 OUTPUT FORMAT — return ONLY a valid JSON array:
 [
@@ -245,6 +317,19 @@ No markdown, no explanation, no text outside the JSON array."""
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+def _build_avoid_block(avoid_texts: list[str] | None) -> str:
+    """Render a 'do not repeat these' section from recently-used question stems."""
+    if not avoid_texts:
+        return ""
+    # Only the most recent stems matter and keep the prompt compact.
+    recent = avoid_texts[-40:]
+    listed = "\n".join(f"  - {t[:140]}" for t in recent)
+    return (
+        "\nALREADY ASKED — do NOT repeat, rephrase, or test the same idea as any of "
+        f"these {len(recent)} questions:\n{listed}\n"
+    )
 
 
 # ─── Response parsing ─────────────────────────────────────────────────────────
@@ -340,3 +425,156 @@ def _normalize(q: dict) -> dict:
         "correct_answer": new_correct,
         "explanation": str(q.get("explanation", "")),
     }
+
+
+# ─── Deduplication ────────────────────────────────────────────────────────────
+
+def _stem(text: str) -> str:
+    """
+    Normalize a question into a comparison key for near-duplicate detection:
+    lowercase, strip punctuation, collapse whitespace, keep the leading content.
+    """
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:120]
+
+
+# ─── Answer verification ──────────────────────────────────────────────────────
+
+def _verify_questions(
+    provider: str,
+    model: str,
+    api_key: str,
+    questions: list[Question],
+    json_mode: bool,
+    groq_delay: float,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> list[Question]:
+    """
+    Re-check every question with a deterministic (temperature 0) pass and correct
+    any mistakes — wrong `correct_answer`, miscomputed numbers, or explanations
+    that contradict the marked answer.  Questions that cannot be verified are
+    returned unchanged so generation never silently loses content.
+    """
+    verified: list[Question] = []
+    total_batches = (len(questions) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for batch_idx in range(total_batches):
+        chunk = questions[batch_idx * BATCH_SIZE : (batch_idx + 1) * BATCH_SIZE]
+        if progress_cb:
+            progress_cb(
+                batch_idx,
+                total_batches,
+                f"Verifying answers (batch {batch_idx + 1}/{total_batches})…",
+            )
+        try:
+            messages = _build_verify_messages(chunk)
+            raw = call_llm(
+                provider, model, api_key, messages,
+                json_mode=json_mode, temperature=0.0,
+            )
+            corrected = _parse_response(raw)
+            merged = _merge_corrections(chunk, corrected)
+            verified.extend(merged)
+        except Exception:
+            # Verification is best-effort: on any failure keep the originals.
+            verified.extend(chunk)
+
+        if provider in ("Groq", "Groq (Free)") and batch_idx < total_batches - 1:
+            time.sleep(groq_delay)
+
+    return verified
+
+
+def _build_verify_messages(questions: list[Question]) -> list[dict]:
+    system = (
+        "You are a meticulous exam answer-key checker for machine learning and AI. "
+        "For each question you recompute any arithmetic from scratch, confirm exactly "
+        "one option is correct, and fix the answer key when it is wrong. "
+        "You ALWAYS respond with valid JSON only — no markdown fences, no extra text."
+    )
+
+    payload = json.dumps(
+        [
+            {
+                "id": q["id"],
+                "question": q["question"],
+                "options": q["options"],
+                "correct_answer": q["correct_answer"],
+                "explanation": q.get("explanation", ""),
+            }
+            for q in questions
+        ],
+        indent=2,
+    )
+
+    user = f"""Review the following multiple-choice questions for correctness.
+
+For EACH question:
+1. Re-derive the answer independently. For any math, compute it step by step.
+2. Decide which single option (A/B/C/D) is actually correct given the option TEXT.
+3. If the option texts contain a wrong number (e.g. a miscomputed result), correct
+   that option's text so the correct answer is accurate.
+4. Set "correct_answer" to the letter of the truly correct option.
+5. Make the explanation briefly justify the correct answer (include the computation
+   for math questions).
+6. Keep the same "id" and keep all four options A–D present.
+
+Return ONLY a JSON array with the corrected questions, each as:
+{{"id": <int>, "question": <str>, "options": {{"A":..,"B":..,"C":..,"D":..}},
+  "correct_answer": <letter>, "explanation": <str>}}
+
+QUESTIONS TO REVIEW:
+{payload}
+
+No markdown, no commentary — only the JSON array."""
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _merge_corrections(
+    originals: list[Question], corrected: list[Question]
+) -> list[Question]:
+    """
+    Apply verifier output back onto the original questions by id. Only the answer,
+    explanation, and (when provided) option text are updated; topic/difficulty/id
+    are preserved. Originals without a valid correction are kept as-is.
+    """
+    by_id: dict[int, dict] = {}
+    for c in corrected:
+        try:
+            by_id[int(c.get("id", -1))] = c
+        except (TypeError, ValueError):
+            continue
+
+    letters = ("A", "B", "C", "D")
+    result: list[Question] = []
+    for q in originals:
+        c = by_id.get(q["id"])
+        if not c:
+            result.append(q)
+            continue
+
+        new_correct = str(c.get("correct_answer", q["correct_answer"])).upper()
+        if new_correct not in letters:
+            new_correct = q["correct_answer"]
+
+        # Accept corrected option text only if all four letters are present.
+        c_opts = c.get("options", {})
+        if isinstance(c_opts, dict) and all(
+            letter in c_opts and str(c_opts[letter]).strip() for letter in letters
+        ):
+            options = {letter: str(c_opts[letter]) for letter in letters}
+        else:
+            options = q["options"]
+
+        merged = dict(q)
+        merged["options"] = options
+        merged["correct_answer"] = new_correct
+        merged["explanation"] = str(c.get("explanation", q.get("explanation", "")))
+        result.append(merged)
+
+    return result

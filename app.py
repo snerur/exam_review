@@ -80,6 +80,9 @@ st.markdown(
 _DEFAULTS: dict = {
     # Shared
     "api_key_valid": False,
+    # Every question stem shown this session (exam + practice) — used to
+    # guarantee new generations never repeat earlier questions.
+    "seen_question_stems": [],
     # Generate Exam tab
     "exam_questions": [],
     "exam_title": "",
@@ -154,6 +157,16 @@ def _require_api_key() -> bool:
         st.warning("Enter your API key in the sidebar to continue.")
         return False
     return True
+
+
+def _record_seen(questions: list[dict]) -> None:
+    """Remember question stems so future generations don't repeat them.
+
+    Capped to the most recent 200 so the avoid-list stays a manageable size.
+    """
+    seen = st.session_state.seen_question_stems
+    seen.extend(q.get("question", "") for q in questions if q.get("question"))
+    st.session_state.seen_question_stems = seen[-200:]
 
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
@@ -328,6 +341,13 @@ with tab_gen:
             difficulties = ["Medium"]
             st.caption("Defaulting to Medium.")
 
+        verify_answers = st.checkbox(
+            "Verify answers for accuracy",
+            value=True,
+            help="Runs a second pass that re-checks every answer and recomputes any "
+            "math. More accurate, but slower and uses extra API calls.",
+        )
+
     # ── Generate button — full-width below columns ─────────────────────────
     st.divider()
 
@@ -363,6 +383,8 @@ with tab_gen:
             _gen_n = num_questions
             _gen_diff = list(difficulties)
             _gen_title = exam_title
+            _gen_verify = verify_answers
+            _gen_avoid = list(st.session_state.seen_question_stems)
 
             progress_bar = st.progress(0)
             status_area = st.empty()
@@ -382,9 +404,12 @@ with tab_gen:
                         num_questions=_gen_n,
                         difficulties=_gen_diff,
                         progress_cb=_progress,
+                        avoid_questions=_gen_avoid,
+                        verify=_gen_verify,
                     )
                 progress_bar.progress(100)
                 status_area.empty()
+                _record_seen(questions)
                 st.session_state.exam_questions = questions
                 st.session_state.exam_title = _gen_title
                 st.session_state.generate_exam_requested = False
@@ -433,6 +458,13 @@ with tab_practice:
                 options=DIFFICULTY_OPTIONS,
                 value="Medium",
             )
+            practice_verify = st.checkbox(
+                "Verify answers for accuracy",
+                value=True,
+                key="practice_verify",
+                help="Re-checks every answer and recomputes any math before the "
+                "quiz starts. More accurate, but slower.",
+            )
 
         if not api_key:
             st.warning("Enter your API key in the sidebar.", icon="🔑")
@@ -456,7 +488,10 @@ with tab_practice:
                         topics=[topic_str],
                         num_questions=practice_n,
                         difficulties=[practice_diff],
+                        avoid_questions=list(st.session_state.seen_question_stems),
+                        verify=practice_verify,
                     )
+                    _record_seen(qs)
                     st.session_state.practice_questions = qs
                     st.session_state.practice_idx = 0
                     st.session_state.practice_answers = {}
