@@ -26,7 +26,7 @@ from llm_providers import PROVIDER_MODELS, validate_api_key
 PROVIDER_KEY_HINTS = {
     "OpenAI": ("sk-...", "https://platform.openai.com/api-keys"),
     "Gemini": ("AIza...", "https://aistudio.google.com/app/apikey"),
-    "Claude": ("sk-ant-...", "https://console.anthropic.com/"),
+    "Claude": ("sk-ant-api03-...", "https://console.anthropic.com/"),
     "Groq (Free)": ("gsk_...", "https://console.groq.com/keys"),
 }
 
