@@ -96,7 +96,7 @@ def generate_exam(
     """
     topics_str = "\n".join(f"  - {t}" for t in topics)
     diff_instruction = _build_difficulty_instruction(difficulties)
-    json_mode = provider in ("OpenAI", "Groq", "Groq (Free)")
+    json_mode = provider in ("OpenAI", "Gemini", "Groq", "Groq (Free)")
 
     all_questions: list[Question] = []
     # Stems we must not repeat: previously-seen (passed in) + everything we add.
@@ -451,7 +451,7 @@ def _verify_questions(
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> list[Question]:
     """
-    Re-check every question with a deterministic (temperature 0) pass and correct
+    Re-check every question (temperature 0 where supported) and correct
     any mistakes — wrong `correct_answer`, miscomputed numbers, or explanations
     that contradict the marked answer.  Questions that cannot be verified are
     returned unchanged so generation never silently loses content.

@@ -12,19 +12,19 @@ Cost-minimisation techniques applied:
   - Groq: free-tier rate-limit delays are handled upstream in exam_generator.py.
 """
 from __future__ import annotations
-import time
 
 
 PROVIDER_MODELS: dict[str, list[str]] = {
-    "OpenAI": ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+    "OpenAI": ["gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-5.2", "gpt-4o-mini", "gpt-4o"],
     "Gemini": [
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.1-pro-preview",
     ],
     "Claude": [
         "claude-haiku-4-5-20251001",
+        "claude-sonnet-5",
+        "claude-opus-5-5",
         "claude-sonnet-4-6",
         "claude-opus-4-7",
     ],
@@ -35,6 +35,30 @@ PROVIDER_MODELS: dict[str, list[str]] = {
         "gemma2-9b-it",
     ],
 }
+
+def supports_temperature(provider: str, model: str) -> bool:
+    """Only send sampling overrides to known compatible model families.
+
+    Reasoning models use their defaults. Gemini 3 also recommends retaining
+    the default temperature rather than lowering it for verification.
+    """
+    if provider == "OpenAI":
+        return model.startswith(("gpt-4o", "gpt-4.1", "gpt-3.5-turbo"))
+    if provider in ("Claude", "Anthropic"):
+        return model.startswith(("claude-haiku-4-5", "claude-sonnet-4-6"))
+    if provider == "Gemini":
+        return model.removeprefix("models/").startswith("gemini-2.5-")
+    return provider in ("Groq", "Groq (Free)")
+
+
+def _require_text(text: str | None, provider: str) -> str:
+    if not text or not text.strip():
+        raise ValueError(
+            f"{provider}: the model returned no text (it may have been blocked "
+            "or exhausted its output budget). Try again or choose another model."
+        )
+    return text
+
 
 # Messages format: list of {"role": "system"|"user"|"assistant", "content": str}
 Messages = list[dict[str, str]]
@@ -57,7 +81,7 @@ def call_llm(
         api_key: Provider API key.
         messages: Conversation history in OpenAI-style message format.
         json_mode: Request structured JSON output where natively supported.
-        temperature: Sampling temperature (0.0 = deterministic, 0.9 = diverse).
+        temperature: Sampling preference; omitted when unsupported or discouraged.
 
     Returns:
         Raw string response from the model.
@@ -69,8 +93,8 @@ def call_llm(
         if provider == "OpenAI":
             return _call_openai(model, api_key, messages, json_mode, temperature)
         elif provider == "Gemini":
-            return _call_gemini(model, api_key, messages, temperature)
-        elif provider == "Claude":
+            return _call_gemini(model, api_key, messages, temperature, json_mode)
+        elif provider in ("Claude", "Anthropic"):
             return _call_claude(model, api_key, messages, temperature)
         elif provider in ("Groq", "Groq (Free)"):
             return _call_groq(model, api_key, messages, json_mode, temperature)
@@ -93,9 +117,10 @@ def _call_openai(
     kwargs: dict = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
-        "max_tokens": 4096,
+        "max_completion_tokens": 16384,
     }
+    if supports_temperature("OpenAI", model):
+        kwargs["temperature"] = temperature
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
@@ -106,7 +131,7 @@ def _call_openai(
     except RateLimitError:
         raise ValueError("OpenAI: rate limit or quota exceeded.")
 
-    return resp.choices[0].message.content or ""
+    return _require_text(resp.choices[0].message.content, "OpenAI")
 
 
 # ─── Claude (Anthropic) ───────────────────────────────────────────────────────
@@ -127,9 +152,11 @@ def _call_claude(model: str, api_key: str, messages: Messages, temperature: floa
     kwargs: dict = {
         "model": model,
         "max_tokens": 8192,
-        "temperature": temperature,
         "messages": chat_messages,
     }
+
+    if supports_temperature("Claude", model):
+        kwargs["temperature"] = temperature
 
     # Ephemeral prompt caching: the system block is stored server-side for 5 minutes.
     # Back-to-back batches and the verification pass reuse the cache, saving ~90 %
@@ -150,16 +177,18 @@ def _call_claude(model: str, api_key: str, messages: Messages, temperature: floa
     except anthropic.RateLimitError:
         raise ValueError("Claude: rate limit exceeded. Please wait and try again.")
 
-    return resp.content[0].text
+    return _require_text("".join(block.text for block in resp.content if block.type == "text"), "Claude")
 
 
 # ─── Gemini (google-genai SDK v1.x) ──────────────────────────────────────────
 
-def _call_gemini(model: str, api_key: str, messages: Messages, temperature: float) -> str:
+def _call_gemini(
+    model: str, api_key: str, messages: Messages, temperature: float, json_mode: bool = False
+) -> str:
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, vertexai=False)
 
     system_parts: list[str] = []
     contents: list[types.Content] = []
@@ -179,34 +208,39 @@ def _call_gemini(model: str, api_key: str, messages: Messages, temperature: floa
 
     system_instruction = "\n\n".join(system_parts) if system_parts else None
 
-    config_kwargs: dict = {"temperature": temperature, "max_output_tokens": 4096}
+    config_kwargs: dict = {"max_output_tokens": 16384}
+    if supports_temperature("Gemini", model):
+        config_kwargs["temperature"] = temperature
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
     if system_instruction:
         config_kwargs["system_instruction"] = system_instruction
     config = types.GenerateContentConfig(**config_kwargs)
 
     try:
-        if len(contents) > 1:
-            # Multi-turn: open a chat session with prior turns as history
-            chat = client.chats.create(
-                model=model,
-                history=contents[:-1],
-                config=config,
-            )
-            resp = chat.send_message(contents[-1].parts[0].text)
-        else:
-            user_text = contents[0].parts[0].text if contents else ""
-            resp = client.models.generate_content(
-                model=model,
-                contents=user_text,
-                config=config,
-            )
-        return resp.text
-
+        resp = client.models.generate_content(
+            model=model.removeprefix("models/"),
+            contents=contents,
+            config=config,
+        )
+        return _require_text(resp.text, "Gemini")
+    except ValueError:
+        raise
     except Exception as exc:
+        code = getattr(exc, "code", None)
         err = str(exc).lower()
-        if any(k in err for k in ("api_key", "api key", "invalid", "unauthorized", "403", "401")):
-            raise ValueError("Gemini: invalid API key. Check your key at aistudio.google.com.")
-        raise ValueError(f"Gemini: {exc}")
+        if "api_key_invalid" in err or "api key not valid" in err or code == 401:
+            raise ValueError("Gemini: invalid API key. Check your key at aistudio.google.com.") from exc
+        if code == 404:
+            raise ValueError(f"Gemini: model {model!r} is unavailable. Select another model.") from exc
+        if code == 403:
+            raise ValueError("Gemini: permission denied. Check model access and API project permissions.") from exc
+        if code == 429:
+            raise ValueError("Gemini: rate limit or quota exceeded.") from exc
+        raise ValueError(f"Gemini: {exc}") from exc
+    finally:
+        client.close()
+
 
 
 # ─── Groq ────────────────────────────────────────────────────────────────────
@@ -247,7 +281,7 @@ def validate_api_key(provider: str, model: str, api_key: str) -> tuple[bool, str
             api_key=api_key,
             messages=[{"role": "user", "content": "Reply with the single word: OK"}],
         )
-        return True, "API key validated successfully."
+        return True, f"Connection to {provider} / {model} validated successfully."
     except ValueError as exc:
         return False, str(exc)
     except Exception as exc:

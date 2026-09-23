@@ -19,7 +19,7 @@ from exam_utils import (
     calculate_score,
     safe_filename,
 )
-from llm_providers import PROVIDER_MODELS, validate_api_key
+from llm_providers import PROVIDER_MODELS, supports_temperature, validate_api_key
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -109,20 +109,27 @@ with st.sidebar:
     st.caption("For students & professors — powered by LLMs")
     st.divider()
 
+    def _reset_validation() -> None:
+        st.session_state.api_key_valid = False
+
     # Provider
-    provider = st.selectbox("LLM Provider", list(PROVIDER_MODELS.keys()))
-    model = st.selectbox("Model", PROVIDER_MODELS[provider])
+    provider = st.selectbox("LLM Provider", list(PROVIDER_MODELS.keys()), on_change=_reset_validation)
+    model = st.selectbox("Model", PROVIDER_MODELS[provider], key=f"model_{provider}", on_change=_reset_validation)
+    if not supports_temperature(provider, model):
+        st.caption("This model uses its default sampling settings.")
 
     hint, url = PROVIDER_KEY_HINTS.get(provider, ("", ""))
     api_key = st.text_input(
         "API Key",
         type="password",
+        key=f"api_key_{provider}",
+        on_change=_reset_validation,
         placeholder=hint,
         help=f"Obtain your key at: {url}",
     )
 
     if api_key:
-        if st.button("✔ Validate Key", use_container_width=True):
+        if st.button("✔ Validate Connection", use_container_width=True):
             with st.spinner("Validating…"):
                 ok, msg = validate_api_key(provider, model, api_key)
             if ok:
@@ -132,7 +139,7 @@ with st.sidebar:
                 st.session_state.api_key_valid = False
                 st.error(msg)
         if st.session_state.api_key_valid:
-            st.success("Key valid", icon="✅")
+            st.success(f"Connected to {model}", icon="✅")
     else:
         st.session_state.api_key_valid = False
         st.info(f"[Get an API key]({url})", icon="🔑")
